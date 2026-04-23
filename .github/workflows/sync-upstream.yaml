@@ -1,0 +1,46 @@
+name: Sync Upstream and Regenerate Lock
+
+on:
+  schedule:
+    - cron: '0 1 * * 1'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream and rebase
+        run: |
+          git remote add upstream https://github.com/alpacahq/alpaca-mcp-server.git
+          git fetch upstream
+          git rebase upstream/main
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Regenerate uv.lock
+        run: uv lock --upgrade
+
+      - name: Amend lock commit if changed
+        run: |
+          if ! git diff --quiet uv.lock; then
+            git add uv.lock
+            git commit --amend --no-edit
+          fi
+
+      - name: Force push
+        run: git push --force-with-lease origin main
