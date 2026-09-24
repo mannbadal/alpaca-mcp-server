@@ -8,13 +8,25 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: docker-publish
+  cancel-in-progress: true
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: write
 
     steps:
+      # GitHub disables scheduled workflows after 60 days without repo activity; re-enabling resets the timer.
+      - name: Keep scheduled workflow alive
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/docker-publish.yaml/enable"
+
       - name: Checkout repository
         uses: actions/checkout@v4
 

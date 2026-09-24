@@ -1,46 +1,89 @@
 name: Sync Upstream and Regenerate Lock
 
+# Merges alpacahq/alpaca-mcp-server main into this fork, then triggers the Docker build.
+# Pushes made with GITHUB_TOKEN are rejected when upstream changes files under .github/workflows/.
+# To sync those automatically, add a SYNC_TOKEN secret (PAT with `repo` + `workflow` scopes).
+
 on:
   schedule:
-    - cron: '0 1 * * 1'
+    - cron: '0 1 * * *'
   workflow_dispatch:
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
 
     steps:
+      - name: Keep scheduled workflow alive
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/sync-upstream.yaml/enable"
+
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
 
       - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Add upstream and rebase
-        run: |
-          git remote add upstream https://github.com/alpacahq/alpaca-mcp-server.git
-          git fetch upstream
-          git rebase upstream/main
-
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
-      - name: Regenerate uv.lock
-        run: uv lock --upgrade
-
-      - name: Amend lock commit if changed
+      - name: Merge upstream
         run: |
-          if ! git diff --quiet uv.lock; then
-            git add uv.lock
-            git commit --amend --no-edit
+          git remote add upstream https://github.com/alpacahq/alpaca-mcp-server.git
+          git fetch --no-tags upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date with upstream."
+            exit 0
           fi
 
-      - name: Force push
-        run: git push --force-with-lease origin main
+          if ! git merge --no-edit upstream/main; then
+            conflicts=$(git diff --name-only --diff-filter=U)
+            if [ "$conflicts" != "uv.lock" ]; then
+              echo "::error::Merge conflicts need manual resolution: $(echo $conflicts)"
+              exit 1
+            fi
+            git checkout --theirs uv.lock
+            git add uv.lock
+            git commit --no-edit
+          fi
+
+      - name: Regenerate uv.lock if stale
+        run: |
+          uv lock
+          if ! git diff --quiet uv.lock; then
+            git add uv.lock
+            git commit -m "chore: regenerate uv.lock"
+          fi
+
+      - name: Push
+        id: push
+        run: |
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git push origin HEAD:main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      # Pushes made with GITHUB_TOKEN don't trigger `on: push` workflows, so dispatch the build explicitly.
+      - name: Trigger Docker build
+        if: steps.push.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run docker-publish.yaml --repo "${{ github.repository }}" --ref main
