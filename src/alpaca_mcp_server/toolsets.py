@@ -113,6 +113,21 @@ TOOLSETS: dict[str, dict] = {
             "News",
         },
     },
+    "fixed-income-data": {
+        "spec": "market-data",
+        "operations": {
+            "FixedIncomeLatestQuotes",
+        },
+    },
+    "locates": {
+        "spec": "trading",
+        "operations": {
+            "listLocates",
+            "createLocates",
+            "getLocate",
+            "listLocateQuotes",
+        },
+    },
 }
 
 OVERRIDE_OPERATION_IDS = {

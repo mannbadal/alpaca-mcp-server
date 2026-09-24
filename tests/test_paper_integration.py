@@ -48,16 +48,80 @@ def _to_dict(obj) -> dict | list | str:
 
 
 def _parse(result) -> dict | list | str:
-    """Extract usable data from a CallToolResult."""
+    """Extract usable data from a CallToolResult.
+
+    Automatically unwraps the trust-boundary envelope so tests can
+    assert on the original API payload directly.
+    """
     if hasattr(result, "data") and result.data is not None:
-        return _to_dict(result.data)
-    for block in result.content:
-        if hasattr(block, "text"):
-            try:
-                return json.loads(block.text)
-            except (json.JSONDecodeError, TypeError):
-                return block.text
-    return str(result)
+        parsed = _to_dict(result.data)
+    else:
+        parsed = None
+        for block in result.content:
+            if hasattr(block, "text"):
+                try:
+                    parsed = json.loads(block.text)
+                    break
+                except (json.JSONDecodeError, TypeError):
+                    parsed = block.text
+                    break
+        if parsed is None:
+            return str(result)
+
+    if isinstance(parsed, dict) and "_alpaca_mcp_security" in parsed and "data" in parsed:
+        return parsed["data"]
+    return parsed
+
+
+def _skip_if_market_data_unavailable(tool_name: str, result: dict | list | str) -> None:
+    """Skip beta market-data tools when CI credentials lack the data entitlement."""
+    if not isinstance(result, dict):
+        return
+
+    text = json.dumps(result).lower()
+    error = result.get("error")
+    status = result.get("http_status") or result.get("status")
+    if isinstance(error, dict):
+        status = status or error.get("http_status") or error.get("status")
+
+    if status in {403, 429} or any(
+        marker in text
+        for marker in (
+            "forbidden",
+            "entitlement",
+            "subscription",
+            "permission",
+            "rate limit",
+            "too many requests",
+        )
+    ):
+        pytest.skip(f"{tool_name} unavailable for these API credentials")
+
+
+async def _call_beta_market_data(tool_name: str, args: dict | None = None) -> dict | list | str:
+    """Call beta market-data tools, tolerating entitlement gaps in CI."""
+    try:
+        result = await _call(tool_name, args)
+    except Exception as exc:
+        text = str(exc).lower()
+        if any(
+            marker in text
+            for marker in (
+                "403",
+                "429",
+                "forbidden",
+                "entitlement",
+                "subscription",
+                "permission",
+                "rate limit",
+                "too many requests",
+            )
+        ):
+            pytest.skip(f"{tool_name} unavailable for these API credentials")
+        raise
+
+    _skip_if_market_data_unavailable(tool_name, result)
+    return result
 
 
 async def _call(tool_name: str, args: dict | None = None) -> dict | list | str:
@@ -70,6 +134,34 @@ async def _call(tool_name: str, args: dict | None = None) -> dict | list | str:
     async with Client(transport=server) as c:
         raw = await c.call_tool(tool_name, args or {})
     return _parse(raw)
+
+
+async def _cancel_order_after_replace(mcp: Client, order_id: str) -> None:
+    """Cancel an order that may still be transitioning through replacement."""
+    last_error: Exception | None = None
+    cancel_id = order_id
+
+    for _ in range(12):
+        try:
+            await mcp.call_tool("cancel_order_by_id", {"order_id": cancel_id})
+            return
+        except Exception as exc:
+            text = str(exc).lower()
+            if "pending replacement" not in text and '"replaced" state' not in text:
+                raise
+            last_error = exc
+
+        await asyncio.sleep(0.5)
+        current = _parse(await mcp.call_tool("get_order_by_id", {"order_id": order_id}))
+        if isinstance(current, dict):
+            cancel_id = current.get("replaced_by") or cancel_id
+
+    try:
+        await mcp.call_tool("cancel_all_orders", {})
+    except Exception:
+        if last_error is not None:
+            raise last_error
+        raise
 
 
 # ── Account ─────────────────────────────────────────────────────────────
@@ -107,6 +199,16 @@ async def test_get_account_activities_by_type():
         "activity_type": "FILL",
     })
     assert isinstance(result, (dict, list))
+
+
+async def test_get_account_activities_filtered_by_order_id():
+    # A nil order id matches nothing, so an empty result confirms the filter
+    # is accepted and applied rather than ignored.
+    result = await _call("get_account_activities", {
+        "order_id": "00000000-0000-0000-0000-000000000000",
+    })
+    activities = result.get("result", result) if isinstance(result, dict) else result
+    assert activities == []
 
 
 # ── Market Data: Stocks ─────────────────────────────────────────────────
@@ -327,6 +429,17 @@ async def test_get_corporate_actions():
     assert isinstance(result, dict)
 
 
+# ── Market Data: Fixed Income ────────────────────────────────────────────
+
+
+async def test_get_fixed_income_latest_quotes():
+    result = await _call_beta_market_data("get_fixed_income_latest_quotes", {
+        "isins": "US912797SX61",
+    })
+    assert isinstance(result, dict)
+    assert "quotes" in result
+
+
 # ── Assets & Market Info ────────────────────────────────────────────────
 
 
@@ -439,15 +552,20 @@ async def test_replace_order():
         }))
         assert "error" not in order, f"Order failed: {order}"
         order_id = order["id"]
-        cancel_id = order_id
 
         try:
-            # Wait for the order to leave pending_new (API rejects replace on pending_new)
+            # Wait for a replaceable status; the API rejects replace on pending_new
+            # and accepted, and day orders sit in accepted while the market is closed
+            status = None
             for _ in range(10):
                 current = _parse(await mcp.call_tool("get_order_by_id", {"order_id": order_id}))
-                if current.get("status") != "pending_new":
+                status = current.get("status")
+                if status not in ("pending_new", "accepted"):
                     break
                 await asyncio.sleep(0.5)
+
+            if status in ("pending_new", "accepted"):
+                pytest.skip(f"order stuck in {status} (market closed); replace unavailable")
 
             replaced = _parse(await mcp.call_tool("replace_order_by_id", {
                 "order_id": order_id,
@@ -455,9 +573,8 @@ async def test_replace_order():
                 "limit_price": "1.50",
             }))
             assert isinstance(replaced, dict)
-            cancel_id = replaced.get("id", order_id)
         finally:
-            await mcp.call_tool("cancel_order_by_id", {"order_id": cancel_id})
+            await _cancel_order_after_replace(mcp, order_id)
 
 
 async def test_get_orders():
@@ -678,3 +795,34 @@ async def test_update_account_config():
             await mcp.call_tool("update_account_config", {
                 "trade_confirm_email": orig_value,
             })
+
+
+# ── Locates (Short Selling) ─────────────────────────────────────────────
+
+
+async def test_get_locates():
+    """List locates — returns a list (may be empty).
+
+    Locates may not be available on all paper accounts (404).
+    """
+    try:
+        result = await _call("get_locates")
+    except Exception as exc:
+        if "404" in str(exc) or "not found" in str(exc).lower():
+            pytest.skip("Locates endpoint not available on this paper account")
+        raise
+    assert isinstance(result, (dict, list))
+
+
+async def test_get_locate_quotes():
+    """Get locate quotes for a symbol.
+
+    Locates may not be available on all paper accounts (404).
+    """
+    try:
+        result = await _call("get_locate_quotes", {"symbols": "AAPL"})
+    except Exception as exc:
+        if "404" in str(exc) or "not found" in str(exc).lower():
+            pytest.skip("Locates endpoint not available on this paper account")
+        raise
+    assert isinstance(result, (dict, list))

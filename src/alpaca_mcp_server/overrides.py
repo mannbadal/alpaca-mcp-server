@@ -84,6 +84,7 @@ def register_order_tools(
         take_profit_limit_price: Optional[str] = None,
         stop_loss_stop_price: Optional[str] = None,
         stop_loss_limit_price: Optional[str] = None,
+        advanced_instructions: Optional[dict] = None,
     ) -> dict:
         """Place a stock or ETF order.
 
@@ -100,8 +101,9 @@ def register_order_tools(
             stop_price: Required for stop and stop_limit orders.
             trail_price: Dollar trail amount for trailing_stop orders.
             trail_percent: Percent trail for trailing_stop orders.
-            extended_hours: Allow execution in extended hours. Only works
-                            with type="limit" and time_in_force="day".
+            extended_hours: Allow execution in pre-market, after-hours, and
+                            overnight sessions. Only works with type="limit"
+                            and time_in_force="day" or "gtc".
             client_order_id: Unique idempotency key. If the request times out,
                              you can safely retry with the same value — the API
                              will reject duplicates. Recommended for every order.
@@ -111,6 +113,34 @@ def register_order_tools(
             take_profit_limit_price: Limit price for bracket take-profit leg.
             stop_loss_stop_price: Stop price for bracket stop-loss leg.
             stop_loss_limit_price: Limit price for bracket stop-loss leg.
+            advanced_instructions: Alpaca Elite Smart Router routing/algo
+                payload. Stocks-only (the Elite docs explicitly note options
+                and crypto reject the payload). Requires the account to be
+                on Elite Smart Router routing; non-Elite accounts will see
+                the field ignored or rejected by Alpaca's API. Shapes:
+                  DMA Gateway (direct routing):
+                    {"algorithm": "DMA",
+                     "destination": "NYSE"|"NASDAQ"|"ARCA",
+                     "display_qty": "<round lot, optional>"}
+                    Only with type="limit"|"market" and time_in_force="day";
+                    not compatible with opg/cls/gtc or stop orders.
+                  VWAP (Volume-Weighted Average Price):
+                    {"algorithm": "VWAP",
+                     "start_time": "<RFC3339, optional>",
+                     "end_time":   "<RFC3339, optional>",
+                     "max_percentage": "<0<x<1, optional>"}
+                    Does NOT participate in open/close auctions.
+                  TWAP (Time-Weighted Average Price):
+                    {"algorithm": "TWAP",
+                     "start_time": "<RFC3339, optional>",
+                     "end_time":   "<RFC3339, optional>",
+                     "max_percentage": "<0<x<1, optional>"}
+                    Does NOT participate in open/close auctions.
+                NOTE: PATCH /v2/orders/{id} already documents
+                `advanced_instructions` in the OpenAPI spec
+                (PatchOrderRequest), and `replace_order_by_id` exposes
+                it through auto-generation — this patch only addresses
+                the POST-side asymmetry.
         """
         if stop_loss_limit_price is not None and stop_loss_stop_price is None:
             return _error(
@@ -155,6 +185,8 @@ def register_order_tools(
             if stop_loss_limit_price is not None:
                 sl["limit_price"] = stop_loss_limit_price
             body["stop_loss"] = sl
+        if advanced_instructions is not None:
+            body["advanced_instructions"] = advanced_instructions
 
         return await _post_order(client, body)
 

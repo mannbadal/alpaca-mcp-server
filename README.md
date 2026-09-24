@@ -113,6 +113,14 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (Mac) or 
 }
 ```
 
+### Claude Mobile
+
+Claude Mobile requires a remote MCP server. This package does not configure remote MCP authentication, so do not expose it directly to the public internet with your Alpaca API keys. Use the local stdio setup from a supported desktop client.
+
+### ChatGPT
+
+ChatGPT requires a remote MCP server. This package does not configure remote MCP authentication, so do not expose it directly to the public internet with your Alpaca API keys. Use the local stdio setup from a supported desktop client.
+
 ### Cursor
 
 Install from the [Cursor Directory](https://cursor.directory/mcp/alpaca) in a few clicks, or add to `~/.cursor/mcp.json`:
@@ -138,23 +146,21 @@ Create `.vscode/mcp.json` in your project root. See the [official docs](https://
 
 ```json
 {
-  "mcp": {
-    "servers": {
-      "alpaca": {
-        "type": "stdio",
-        "command": "uvx",
-        "args": ["alpaca-mcp-server"],
-        "env": {
-          "ALPACA_API_KEY": "your_alpaca_api_key",
-          "ALPACA_SECRET_KEY": "your_alpaca_secret_key"
-        }
+  "servers": {
+    "alpaca": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["alpaca-mcp-server"],
+      "env": {
+        "ALPACA_API_KEY": "your_alpaca_api_key",
+        "ALPACA_SECRET_KEY": "your_alpaca_secret_key"
       }
     }
   }
 }
 ```
 
-**PyCharm**  
+### PyCharm
 
 See the [official guide](https://www.jetbrains.com/help/ai-assistant/configure-an-mcp-server.html).
 
@@ -169,7 +175,7 @@ See the [official guide](https://www.jetbrains.com/help/ai-assistant/configure-a
    ALPACA_SECRET_KEY=your_alpaca_secret_key
   ```
 
-**Claude Code**  
+### Claude Code
 
 ```bash
 claude mcp add alpaca --scope user --transport stdio uvx alpaca-mcp-server \
@@ -179,17 +185,16 @@ claude mcp add alpaca --scope user --transport stdio uvx alpaca-mcp-server \
 
 Verify with `/mcp` in the Claude Code CLI.
 
-**Gemini CLI**  
+### Antigravity CLI
 
-See the [Gemini CLI MCP docs](https://github.com/google-gemini/gemini-cli/blob/main/docs/tools/mcp-server.md).
+See the [Antigravity MCP docs](https://antigravity.google/docs/mcp).
 
-Add to your `settings.json`:
+Add to `~/.gemini/antigravity-cli/mcp_config.json` (global) or `.agents/mcp_config.json` (workspace):
 
 ```json
 {
   "mcpServers": {
     "alpaca": {
-      "type": "stdio",
       "command": "uvx",
       "args": ["alpaca-mcp-server"],
       "env": {
@@ -201,7 +206,7 @@ Add to your `settings.json`:
 }
 ```
 
-**Docker**  
+### Docker
 
 ```bash
 git clone https://github.com/alpacahq/alpaca-mcp-server.git
@@ -283,7 +288,15 @@ Available toolsets:
 | `options-data`      | Option bars, quotes, trades, snapshots, chain, exchange codes |
 | `corporate-actions` | Corporate action announcements                                |
 | `news`              | News articles for stocks and crypto                           |
+| `fixed-income-data` | Fixed income (bond/treasury) quotes                           |
+| `locates`           | Short-sale locate requests and quotes                         |
 
+
+### ReadMe Docs MCP
+
+Docs are scoped to the Trading API, Market Data API, and Authentication API specs; Broker API endpoint docs are intentionally excluded from this server.
+
+If the ReadMe MCP lookup fails, tool responses include fallback links to Alpaca's public docs plus `llms.txt` and `llms-full.txt`.
 
 ## Features
 
@@ -477,6 +490,25 @@ Available toolsets:
 
 - `get_news` — News articles for stocks and crypto
 
+**Fixed Income Data**
+
+- `get_fixed_income_latest_quotes` — Latest quotes for fixed income securities by ISIN
+
+**Locates (Short Selling)**
+
+- `get_locates` — List locate requests filtered by status, symbol, or date range
+- `create_locate` — Create a locate request for a short sale
+- `get_locate` — Get a single locate request by ID
+- `get_locate_quotes` — Get locate availability and pricing for symbols
+
+**Documentation**
+
+- `search_alpaca_docs` — Search Alpaca documentation pages and guides
+- `fetch_alpaca_doc` — Fetch one Alpaca ReadMe documentation page by page ID
+- `search_alpaca_api_specs` — Search Alpaca API reference endpoints by topic, path, parameter, or schema term
+- `list_alpaca_api_endpoints` — List endpoints for one allowed Alpaca OpenAPI spec
+- `get_alpaca_endpoint_docs` — Fetch reference docs for one exact Alpaca API endpoint by method and path
+
 ## Testing
 
 The project includes a multi-layered test suite that runs in CI on every pull request:
@@ -484,6 +516,7 @@ The project includes a multi-layered test suite that runs in CI on every pull re
 - **Integrity tests** — Validate consistency between OpenAPI specs, toolset definitions, and tool name/description overrides. No network or credentials required.
 - **Server construction tests** — Build the server with mocked credentials and verify the correct number of tools are exposed. No network required.
 - **Paper API integration tests** — Execute real calls against the Alpaca paper trading API, covering account info, market data, order lifecycle, watchlists, positions, and more. Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY`.
+- **ReadMe integration tests** — Execute live documentation lookup calls against Alpaca's ReadMe MCP. Requires `ALPACA_RUN_README_INTEGRATION=true` when run locally.
 
 Run the full suite locally:
 
@@ -493,6 +526,9 @@ pytest tests/test_integrity.py tests/test_server_construction.py -v
 
 # Integration tests (requires paper API keys)
 ALPACA_API_KEY=... ALPACA_SECRET_KEY=... pytest tests/ -m integration -v
+
+# ReadMe docs integration tests (requires network, no Alpaca credentials)
+ALPACA_RUN_README_INTEGRATION=true pytest tests/test_readme_integration.py -v
 ```
 
 ## Project Structure
@@ -504,10 +540,11 @@ alpaca-mcp-server/
 │       ├── __init__.py
 │       ├── cli.py            ← CLI entry point
 │       ├── server.py         ← FastMCP server built from OpenAPI specs
-│       ├── names.py          ← Tool name and description overrides
+│       ├── tool_registry.py  ← Tool names, descriptions, and output risk classifications
 │       ├── toolsets.py       ← Toolset → operationId allowlists
 │       ├── overrides.py      ← Hand-crafted tools for complex trading endpoints
 │       ├── market_data_overrides.py ← Hand-crafted tools for historical data
+│       ├── readme_docs.py    ← Read-only proxy tools for Alpaca ReadMe docs
 │       └── specs/
 │           ├── trading-api.json
 │           └── market-data-api.json
@@ -515,12 +552,14 @@ alpaca-mcp-server/
 │   ├── conftest.py           ← Shared fixtures and paper-account cleanup
 │   ├── test_integrity.py     ← Spec ↔ toolset ↔ names consistency checks
 │   ├── test_server_construction.py ← Server build verification
+│   ├── test_readme_integration.py ← Live ReadMe docs MCP integration tests
 │   └── test_paper_integration.py   ← Paper API integration tests
 ├── scripts/
 │   └── sync-specs.sh        ← Download latest OpenAPI specs
 ├── .github/
 │   └── workflows/
-│       └── ci.yml            ← CI pipeline (core + integration)
+│       ├── ci.yml            ← CI pipeline (core + integration)
+│       └── publish-pypi.yml  ← PyPI publish on GitHub Release
 ├── AGENTS.md                 ← Instructions for coding agents
 ├── pyproject.toml
 └── README.md
@@ -564,17 +603,17 @@ For information about how Alpaca handles your data, please review:
 
 ### Data Collection
 
-- **What is collected**: User agent string ('ALPACA-MCP-SERVER') for API calls
+- **What is collected**: User agent string (`APCA-MCP-TRADING/<version>`) for API calls
 - **How it's used**: To identify MCP server usage and improve user experience
 - **Third-party sharing**: Not shared with third parties
 - **Retention**: Retained per Alpaca's standard data retention policy
-- **Opt-out**: Modify or remove the `USER_AGENT` constant in `.github/core/user_agent.py`
+- **Opt-out**: Set the `ALPACA_MCP_USER_AGENT` environment variable to an empty string; no User-Agent header will be sent
 
 ## Security Notice
 
 This server can place real trades and access your portfolio. Treat your API keys as sensitive credentials. Review all actions proposed by the LLM carefully, especially for complex options strategies or multi-leg trades.
 
-**HTTP Transport Security**: When using HTTP transport, the server defaults to localhost (127.0.0.1:8000) for security. For remote access, you can bind to all interfaces with `--host 0.0.0.0`, use SSH tunneling (`ssh -L 8000:localhost:8000 user@server`), or set up a reverse proxy with authentication for secure access.
+**HTTP Transport Security**: Streamable HTTP defaults to localhost (`127.0.0.1:8000`) and validates `Host` and `Origin` headers. Docker defaults to stdio. Helm defaults to ClusterIP HTTP with ingress off. Binding to `0.0.0.0` does not provide authentication. This package does not configure MCP OAuth, so do not expose it directly to the public internet. Operators that provide standards-based MCP authentication must also set FastMCP's `FASTMCP_HTTP_ALLOWED_HOSTS` to the exact public hostnames.
 
 ## Support
 

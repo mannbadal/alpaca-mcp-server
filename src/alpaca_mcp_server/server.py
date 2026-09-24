@@ -11,6 +11,7 @@ import json
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 
@@ -18,11 +19,12 @@ import httpx
 from fastmcp import FastMCP
 from fastmcp.server.providers.openapi.routing import MCPType
 
-from .names import TOOL_DESCRIPTIONS, TOOL_NAMES
+from .readme_docs import ReadMeClientFactory, register_readme_docs_tools
+from .security import TrustBoundaryMiddleware
+from .tool_registry import TOOL_DESCRIPTIONS, TOOL_NAMES
 from .toolsets import OVERRIDE_OPERATION_IDS, TOOLSETS, get_active_operations
 
 SPECS_DIR = Path(__file__).parent / "specs"
-_USER_AGENT_FILE = Path(__file__).resolve().parents[2] / ".github" / "core" / "user_agent.py"
 
 TRADING_API_BASE_URLS = {
     "paper": "https://paper-api.alpaca.markets",
@@ -31,35 +33,69 @@ TRADING_API_BASE_URLS = {
 MARKET_DATA_BASE_URL = "https://data.alpaca.markets"
 
 
+def strip_v_from_version(release_version: str) -> str:
+    if release_version[:1] == "v" and release_version[1:2].isdigit():
+        return release_version[1:]
+
+    return release_version
+
+
+def get_mcp_user_agent() -> str:
+    release_version = version("alpaca-mcp-server")
+    return f"APCA-MCP-TRADING/{strip_v_from_version(release_version)}"
+
+
+_OPENAPI_LITERAL_FIELDS = frozenset({"default", "example", "examples"})
+_OPENAPI_NAMED_MAP_FIELDS = frozenset({"properties", "schemas"})
+
+
+def _strip_openapi_vendor_extensions(value: Any) -> Any:
+    """Remove extensions without dropping x-prefixed schema data."""
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            if key.startswith("x-"):
+                continue
+            if key in _OPENAPI_LITERAL_FIELDS:
+                cleaned[key] = item
+            elif key in _OPENAPI_NAMED_MAP_FIELDS and isinstance(item, dict):
+                cleaned[key] = {
+                    name: _strip_openapi_vendor_extensions(entry)
+                    for name, entry in item.items()
+                }
+            else:
+                cleaned[key] = _strip_openapi_vendor_extensions(item)
+        return cleaned
+    if isinstance(value, list):
+        return [_strip_openapi_vendor_extensions(item) for item in value]
+    return value
+
+
 def _load_spec(name: str) -> dict[str, Any]:
     path = SPECS_DIR / f"{name}.json"
-    return json.loads(path.read_text(encoding="utf-8"))
+    spec = json.loads(path.read_text(encoding="utf-8"))
+    return _strip_openapi_vendor_extensions(spec)
 
 
 def _make_filter(allowed_ops: set[str]):
     """Create a route_map_fn that includes only allowlisted operationIds."""
-    def filter_fn(route, default_type):
+
+    def filter_fn(route, _default_type):
         if route.operation_id in allowed_ops and route.operation_id not in OVERRIDE_OPERATION_IDS:
             return MCPType.TOOL
         return MCPType.EXCLUDE
+
     return filter_fn
 
 
 def _make_customizer(descriptions: dict[str, str]):
     """Create an mcp_component_fn that overrides descriptions where provided."""
+
     def customizer(route, component):
         if route.operation_id in descriptions:
             component.description = descriptions[route.operation_id]
+
     return customizer
-
-
-def _load_user_agent() -> str | None:
-    """Load USER_AGENT from .github/core/user_agent.py if it exists."""
-    if not _USER_AGENT_FILE.is_file():
-        return None
-    ns: dict[str, Any] = {}
-    exec(_USER_AGENT_FILE.read_text(encoding="utf-8"), ns)
-    return ns.get("USER_AGENT")
 
 
 def _build_auth_headers() -> dict[str, str]:
@@ -69,15 +105,24 @@ def _build_auth_headers() -> dict[str, str]:
         "APCA-API-KEY-ID": key,
         "APCA-API-SECRET-KEY": secret,
     }
-    user_agent = _load_user_agent()
-    if user_agent:
-        headers["User-Agent"] = user_agent
+    user_agent = os.environ.get("ALPACA_MCP_USER_AGENT")
+    if user_agent is None:
+        user_agent = get_mcp_user_agent()
+    if user_agent.strip():
+        headers["User-Agent"] = user_agent.strip()
     return headers
 
 
 def _get_trading_base_url() -> str:
     paper = os.environ.get("ALPACA_PAPER_TRADE", "true").lower() in ("true", "1", "yes")
     return TRADING_API_BASE_URLS["paper" if paper else "live"]
+
+
+def _ensure_scheme(url: str) -> str:
+    """Prepend ``https://`` when the URL has no scheme (common .env misconfiguration)."""
+    if url and "://" not in url:
+        return f"https://{url}"
+    return url
 
 
 def _parse_toolsets() -> set[str] | None:
@@ -87,33 +132,34 @@ def _parse_toolsets() -> set[str] | None:
     return {t.strip() for t in raw.split(",") if t.strip()}
 
 
-def build_server() -> FastMCP:
+def _make_api_client(base_url: str, headers: dict[str, str]) -> httpx.AsyncClient:
+    client = httpx.AsyncClient(base_url=base_url, headers=headers, timeout=30.0)
+    if "User-Agent" not in headers:
+        client.headers.pop("User-Agent", None)
+    return client
+
+
+def build_server(
+    readme_client_factory: ReadMeClientFactory | None = None,
+) -> FastMCP:
     """Construct the Alpaca MCP server from OpenAPI specs."""
     active_toolsets = _parse_toolsets()
     spec_ops = get_active_operations(active_toolsets)
 
     auth_headers = _build_auth_headers()
     trading_base = _get_trading_base_url()
-    data_base = os.environ.get("DATA_API_URL", MARKET_DATA_BASE_URL).rstrip("/")
+    data_base = _ensure_scheme(os.environ.get("DATA_API_URL", MARKET_DATA_BASE_URL)).rstrip("/")
 
     clients: list[httpx.AsyncClient] = []
 
     trading_client: httpx.AsyncClient | None = None
     if "trading" in spec_ops:
-        trading_client = httpx.AsyncClient(
-            base_url=trading_base,
-            headers=auth_headers,
-            timeout=30.0,
-        )
+        trading_client = _make_api_client(trading_base, auth_headers)
         clients.append(trading_client)
 
     data_client: httpx.AsyncClient | None = None
     if "market-data" in spec_ops:
-        data_client = httpx.AsyncClient(
-            base_url=data_base,
-            headers=auth_headers,
-            timeout=30.0,
-        )
+        data_client = _make_api_client(data_base, auth_headers)
         clients.append(data_client)
 
     @asynccontextmanager
@@ -125,6 +171,7 @@ def build_server() -> FastMCP:
                 await c.aclose()
 
     main = FastMCP("Alpaca MCP Server", lifespan=lifespan)
+    main.add_middleware(TrustBoundaryMiddleware())
 
     if trading_client is not None:
         allowed = spec_ops["trading"]
@@ -162,16 +209,20 @@ def build_server() -> FastMCP:
     if data_client is not None and active_ts & {"stock-data", "crypto-data"}:
         _register_market_data_overrides(main, data_client)
 
+    register_readme_docs_tools(main, client_factory=readme_client_factory)
+
     return main
 
 
 def _register_trading_overrides(server: FastMCP, trading_client: httpx.AsyncClient) -> None:
     """Register hand-crafted override tools for complex trading endpoints."""
     from .overrides import register_order_tools
+
     register_order_tools(server, trading_client)
 
 
 def _register_market_data_overrides(server: FastMCP, data_client: httpx.AsyncClient) -> None:
     """Register hand-crafted override tools for historical market data."""
     from .market_data_overrides import register_market_data_tools
+
     register_market_data_tools(server, data_client)
